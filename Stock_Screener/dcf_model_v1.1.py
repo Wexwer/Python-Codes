@@ -1,34 +1,32 @@
-# app.py
+# Stefan Screener and DCF valuation model
 # NYSE + Nasdaq universe (NasdaqTrader)
 # Tab 1: Screener
 #   - Market cap filter
 #   - MA200 crosses UNDER MA30 within last N trading days (default 7)
 #   - Matched tickers in dropdown -> selecting shows chart
-# Tab 2: DCF (EXACT Sheet 1 logic)
-#   - Only input: WACC in %
-#   - Uses:
-#       g = (TTM Revenue - Prior Year Revenue) / Prior Year Revenue
-#       FCF Margin = TTM FCF / TTM Revenue
-#       4-year revenue forecast using same g
-#       4-year FCF = revenue * margin
-#       Terminal value at end of year 4 using terminal growth = 1%
-#       Shares = MarketCap / Price
-#       Intrinsic = PV / Shares
+#   - Export screener results to Excel
 #
-# Data sources:
-# - Market cap & price: yfinance ticker.info (+ fallback last close)
-# - TTM revenue: quarterly income statement sum last 4 quarters
-# - Prior year revenue: annual income statement most recent year
-# - TTM FCF: quarterly cashflow sum last 4 quarters of (OCF - CapEx)
+# Tab 2: DCF (EXACT Excel Sheet 1 logic)
+#   - Only input: WACC in %
+#   - Shows Undervalued/Overvalued badge (green/red)
+#   - Export DCF to Excel (inputs + forecast + totals)
+#
+# DCF model = Method (4 years + terminal at year 4):
+#   g = (TTM Revenue - Prior Year Revenue) / Prior Year Revenue
+#   FCF Margin = TTM FCF / TTM Revenue
+#   Revenue_t = Revenue_{t-1} * (1 + g) for 4 years (year1 from TTM)
+#   FCF_t = Revenue_t * margin
+#   PV = sum(FCF_t/(1+WACC)^t) + TV/(1+WACC)^4
+#   TV = FCF_4*(1+TerminalGrowth)/(WACC-TerminalGrowth), TerminalGrowth = 1%
+#   Shares (millions) = MarketCap(millions) / Price
+#   Intrinsic = PV(millions) / Shares(millions)
 #
 # Units:
-# - Convert market cap, revenues, FCF to MILLIONS (USD) by /1e6
+# - Convert market cap, revenues, FCF to MILLIONS (USD) by /1e6, due to the data are in thousands
 # - Price stays USD/share
-# - Shares_m = marketcap_m / price  (shares in millions)
-# - Intrinsic price = PV_m / shares_m  (USD/share)
 
 import time
-from io import StringIO
+from io import BytesIO, StringIO
 
 import numpy as np
 import pandas as pd
@@ -37,7 +35,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="NYSE+Nasdaq Screener + Sheet DCF", layout="wide")
+st.set_page_config(page_title="NYSE+Nasdaq Screener + DCF", layout="wide")
 
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
@@ -73,7 +71,7 @@ def load_nyse_nasdaq_universe() -> pd.DataFrame:
 
 
 # -----------------------------
-# Helpers
+# Utility
 # -----------------------------
 def safe_float(x):
     try:
@@ -92,6 +90,40 @@ def fmt_money_short(x):
         if abs(x) >= div:
             return f"{x/div:.2f}{unit}"
     return f"{x:.0f}"
+
+
+def valuation_label(intrinsic: float, price: float) -> tuple[str, str]:
+    if np.isnan(intrinsic) or np.isnan(price) or price <= 0:
+        return "N/A", "#6b7280"  # gray
+    if intrinsic >= price:
+        return "Undervalued", "#16a34a"  # green
+    return "Overvalued", "#dc2626"      # red
+
+
+def render_badge(text: str, color: str):
+    st.markdown(
+        f"""
+        <div style="
+            display:inline-block;
+            padding:8px 12px;
+            border-radius:999px;
+            background:{color}1A;
+            border:1px solid {color}66;
+            color:{color};
+            font-weight:700;">
+            {text}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def df_to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    return output.getvalue()
 
 
 # -----------------------------
@@ -123,7 +155,7 @@ def get_prices(symbol: str, period: str) -> pd.DataFrame:
     return df
 
 
-def cross_under_in_last_n_trading_days(df: pd.DataFrame, n_days: int = 7) -> bool:
+def cross_under_in_last_n_trading_days(df: pd.DataFrame, n_days: int = 3) -> bool:
     if df is None or df.empty:
         return False
     if "MA30" not in df.columns or "MA200" not in df.columns:
@@ -149,12 +181,11 @@ def plot_price_ma(df: pd.DataFrame, title: str):
 
 
 # -----------------------------
-# Yahoo getters for sheet DCF
+# Yahoo getters for Sheet 1 DCF
 # -----------------------------
-def get_market_cap_and_price(t: yf.Ticker) -> tuple[float, float]:
-    """
-    marketCap is USD. price is USD/share.
-    """
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_market_cap_price_name(symbol: str) -> tuple[float, float, str]:
+    t = yf.Ticker(symbol)
     try:
         info = t.info or {}
     except Exception:
@@ -165,6 +196,8 @@ def get_market_cap_and_price(t: yf.Ticker) -> tuple[float, float]:
     if np.isnan(price):
         price = safe_float(info.get("regularMarketPrice"))
 
+    name = info.get("shortName") or info.get("longName") or ""
+
     if np.isnan(price) or price <= 0:
         try:
             hist = t.history(period="10d")
@@ -173,14 +206,12 @@ def get_market_cap_and_price(t: yf.Ticker) -> tuple[float, float]:
         except Exception:
             pass
 
-    return market_cap, price
+    return market_cap, price, str(name)
 
 
-def get_ttm_revenue(t: yf.Ticker) -> float:
-    """
-    TTM Revenue = sum last 4 quarterly Total Revenue.
-    Returns USD.
-    """
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_ttm_revenue(symbol: str) -> float:
+    t = yf.Ticker(symbol)
     try:
         q = t.quarterly_financials
     except Exception:
@@ -191,7 +222,6 @@ def get_ttm_revenue(t: yf.Ticker) -> float:
     for row in ["Total Revenue", "TotalRevenue", "Revenue"]:
         if row in q.index:
             s = q.loc[row].dropna().astype(float)
-            # yfinance often returns most recent quarter first; enforce date ordering if possible
             idx = pd.to_datetime(s.index, errors="coerce")
             if idx.notna().any():
                 s.index = idx
@@ -204,11 +234,9 @@ def get_ttm_revenue(t: yf.Ticker) -> float:
     return np.nan
 
 
-def get_prior_year_revenue(t: yf.Ticker) -> float:
-    """
-    Prior Year Revenue = most recent annual Total Revenue.
-    Returns USD.
-    """
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_prior_year_revenue(symbol: str) -> float:
+    t = yf.Ticker(symbol)
     try:
         a = t.financials
     except Exception:
@@ -228,11 +256,9 @@ def get_prior_year_revenue(t: yf.Ticker) -> float:
     return np.nan
 
 
-def get_ttm_fcf(t: yf.Ticker) -> float:
-    """
-    TTM FCF = sum last 4 quarters of (Operating Cash Flow - CapEx).
-    Returns USD.
-    """
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def get_ttm_fcf(symbol: str) -> float:
+    t = yf.Ticker(symbol)
     try:
         qcf = t.quarterly_cashflow
     except Exception:
@@ -255,7 +281,6 @@ def get_ttm_fcf(t: yf.Ticker) -> float:
     ocf = qcf.loc[ocf_row].dropna().astype(float)
     capex = qcf.loc[capex_row].dropna().astype(float)
 
-    # Align by date index if possible
     try:
         ocf.index = pd.to_datetime(ocf.index, errors="coerce")
         capex.index = pd.to_datetime(capex.index, errors="coerce")
@@ -263,9 +288,7 @@ def get_ttm_fcf(t: yf.Ticker) -> float:
         capex = capex.sort_index()
         if len(ocf) < 4 or len(capex) < 4:
             return np.nan
-        ocf4 = ocf.iloc[-4:]
-        cap4 = capex.iloc[-4:]
-        return float(np.nansum(ocf4.values - cap4.values))
+        return float(np.nansum(ocf.iloc[-4:].values - capex.iloc[-4:].values))
     except Exception:
         if len(ocf) < 4 or len(capex) < 4:
             return np.nan
@@ -273,7 +296,7 @@ def get_ttm_fcf(t: yf.Ticker) -> float:
 
 
 # -----------------------------
-# Sheet 1 DCF implementation (exact structure)
+# Excel Sheet 1 DCF implementation (exact structure)
 # -----------------------------
 def sheet1_dcf_price(
     market_cap_usd: float,
@@ -281,14 +304,9 @@ def sheet1_dcf_price(
     ttm_rev_usd: float,
     prior_rev_usd: float,
     ttm_fcf_usd: float,
-    wacc: float,           # decimal
-    terminal_growth: float # decimal, sheet uses 1%
+    wacc: float,               # decimal
+    terminal_growth: float = 0.01
 ) -> dict:
-    """
-    Returns dict of all intermediates.
-    Everything is computed in MILLIONS except price and rates, matching sheet convention.
-    """
-    # Convert to millions
     market_cap_m = market_cap_usd / 1e6
     ttm_rev_m = ttm_rev_usd / 1e6
     prior_rev_m = prior_rev_usd / 1e6
@@ -297,93 +315,73 @@ def sheet1_dcf_price(
     if any(np.isnan([market_cap_m, price_usd, ttm_rev_m, prior_rev_m, ttm_fcf_m])) or price_usd <= 0:
         return {"ok": False, "reason": "Missing/invalid Market Cap, Price, Revenue, or FCF."}
     if prior_rev_m == 0 or ttm_rev_m == 0:
-        return {"ok": False, "reason": "Revenue is zero or missing."}
+        return {"ok": False, "reason": "Revenue is zero/missing."}
     if terminal_growth >= wacc:
         return {"ok": False, "reason": "Terminal growth must be < WACC."}
 
-    # Sheet: g = (TTM - Prior) / Prior
     g = (ttm_rev_m - prior_rev_m) / prior_rev_m
-
-    # Sheet: FCF margin = TTM FCF / TTM Rev
     fcf_margin = ttm_fcf_m / ttm_rev_m
 
-    # Revenue estimates (4 years), exchange rate = 1
     rev1 = ttm_rev_m * (1 + g)
     rev2 = rev1 * (1 + g)
     rev3 = rev2 * (1 + g)
     rev4 = rev3 * (1 + g)
     revs = [rev1, rev2, rev3, rev4]
 
-    # FCF estimates
-    fcf1 = rev1 * fcf_margin
-    fcf2 = rev2 * fcf_margin
-    fcf3 = rev3 * fcf_margin
-    fcf4 = rev4 * fcf_margin
-    fcfs = [fcf1, fcf2, fcf3, fcf4]
+    fcfs = [r * fcf_margin for r in revs]
 
-    # Discount factors
-    df1 = (1 + wacc) ** 1
-    df2 = (1 + wacc) ** 2
-    df3 = (1 + wacc) ** 3
-    df4 = (1 + wacc) ** 4
-    dfs = [df1, df2, df3, df4]
-
-    # PV of FCFs
+    dfs = [(1 + wacc) ** i for i in [1, 2, 3, 4]]
     pv_fcfs = [fcfs[i] / dfs[i] for i in range(4)]
     pv_sum = float(np.nansum(pv_fcfs))
 
-    # Terminal value based on Year 4 FCF
+    fcf4 = fcfs[-1]
     terminal_val = fcf4 * (1 + terminal_growth) / (wacc - terminal_growth)
-    terminal_pv = terminal_val / df4
+    terminal_pv = terminal_val / dfs[-1]
 
-    # PV of future cash flows
     pv_total = pv_sum + terminal_pv  # millions
-
-    # Shares (millions) = MarketCap(m) / Price
     shares_m = market_cap_m / price_usd
-
-    # Calculated stock price = PV / Shares
-    intrinsic = pv_total / shares_m  # USD/share (since m/m)
+    intrinsic = pv_total / shares_m  # USD/share
 
     return {
         "ok": True,
-        "market_cap_m": market_cap_m,
-        "price": price_usd,
-        "shares_m": shares_m,
-        "ttm_rev_m": ttm_rev_m,
-        "prior_rev_m": prior_rev_m,
-        "ttm_fcf_m": ttm_fcf_m,
+        "intrinsic": float(intrinsic),
+        "pv_sum_m": float(pv_sum),
+        "terminal_val_m": float(terminal_val),
+        "terminal_pv_m": float(terminal_pv),
+        "pv_total_m": float(pv_total),
+        "shares_m": float(shares_m),
+        "market_cap_m": float(market_cap_m),
+        "ttm_rev_m": float(ttm_rev_m),
+        "prior_rev_m": float(prior_rev_m),
+        "ttm_fcf_m": float(ttm_fcf_m),
         "g": float(g),
         "fcf_margin": float(fcf_margin),
         "revs_m": revs,
         "fcfs_m": fcfs,
-        "dfs": dfs,
         "pv_fcfs_m": pv_fcfs,
-        "pv_sum_m": pv_sum,
-        "terminal_growth": terminal_growth,
-        "terminal_val_m": float(terminal_val),
-        "terminal_pv_m": float(terminal_pv),
-        "pv_total_m": float(pv_total),
-        "intrinsic": float(intrinsic),
     }
 
 
 # -----------------------------
-# App
+# App UI
 # -----------------------------
+st.title("📈 NYSE + Nasdaq: Screener + DCF (Excel Sheet Method)")
+
 uni = load_nyse_nasdaq_universe()
 all_symbols = uni["symbol"].tolist()
 
 tab_screener, tab_dcf = st.tabs(["🔎 Screener", "💰 DCF (Excel Sheet 1)"])
 
-# ===== Tab 1: Screener =====
+# =============================
+# TAB 1: Screener
+# =============================
 with tab_screener:
     left, right = st.columns([1, 2], gap="large")
 
     with left:
         st.caption(f"Universe loaded: **{len(uni):,}** tickers (NYSE + Nasdaq)")
-        st.subheader("Filters")
 
+        st.subheader("Filters")
         min_mcap_b = st.number_input("Min Market Cap (USD, billions)", 0.0, 5000.0, 10.0, 1.0)
         max_mcap_b = st.number_input("Max Market Cap (USD, billions)", 0.0, 5000.0, 5000.0, 10.0)
         min_mcap = min_mcap_b * 1e9
@@ -392,8 +390,8 @@ with tab_screener:
         lookback_days = st.slider("Cross-under lookback (trading days)", 1, 30, 7)
         period = st.selectbox("Price history period", ["1y", "2y", "5y"], index=1)
 
-        st.subheader("Performance")
-        max_to_scan = st.slider("Max tickers to scan", 50, 5000, 800)
+        st.subheader("Performance controls")
+        max_to_scan = st.slider("Max tickers to scan", 50, len(all_symbols), min(800, len(all_symbols)))
 
         run_btn = st.button("Run Screener", type="primary")
 
@@ -416,9 +414,8 @@ with tab_screener:
                 status.write(f"Scanning {sym} ({i}/{len(tickers)})...")
                 progress.progress(i / len(tickers))
 
-                t = yf.Ticker(sym)
-                mc, px = get_market_cap_and_price(t)
-                if np.isnan(mc) or mc < min_mcap or mc > max_mcap:
+                market_cap, price, name = get_market_cap_price_name(sym)
+                if np.isnan(market_cap) or market_cap < min_mcap or market_cap > max_mcap:
                     continue
 
                 price_df = get_prices(sym, period)
@@ -429,14 +426,17 @@ with tab_screener:
                     continue
 
                 last_close = float(price_df["Close"].iloc[-1])
+                exchange = uni.loc[uni["symbol"] == sym, "exchange"].iloc[0]
+
                 results.append({
                     "Ticker": sym,
-                    "Exchange": uni.loc[uni["symbol"] == sym, "exchange"].iloc[0],
-                    "MarketCap_fmt": fmt_money_short(mc),
+                    "Name": name,
+                    "Exchange": exchange,
+                    "MarketCap_fmt": fmt_money_short(market_cap),
                     "Last_Close": last_close,
                 })
 
-                time.sleep(0.01)
+                time.sleep(0.005)
 
             status.empty()
             progress.empty()
@@ -446,12 +446,23 @@ with tab_screener:
             st.session_state.screen_selected = df["Ticker"].iloc[0] if not df.empty else None
 
         df = st.session_state.screen_df
+
         if df is None or df.empty:
-            st.info("Run the screener to see matched tickers.")
+            st.info("Run the screener to see matched tickers in a dropdown.")
         else:
             st.dataframe(df, use_container_width=True)
 
+            # Export screener results to Excel
+            excel_bytes = df_to_excel_bytes({"Screener Results": df})
+            st.download_button(
+                "⬇️ Download Screener Results (Excel)",
+                data=excel_bytes,
+                file_name="screener_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
             st.divider()
+            st.subheader("Chart (select a matched ticker)")
             options = df["Ticker"].tolist()
             selected = st.selectbox(
                 "Matched tickers",
@@ -466,7 +477,9 @@ with tab_screener:
             else:
                 st.plotly_chart(plot_price_ma(chart_df, f"{selected} — Daily Close with MA30 & MA200"), use_container_width=True)
 
-# ===== Tab 2: DCF =====
+# =============================
+# TAB 2: DCF
+# =============================
 with tab_dcf:
     left, right = st.columns([1, 2], gap="large")
 
@@ -477,24 +490,21 @@ with tab_dcf:
             all_symbols,
             index=all_symbols.index("AAPL") if "AAPL" in all_symbols else 0
         )
-
         wacc_pct = st.number_input("WACC (%)", min_value=0.0, max_value=50.0, value=11.0, step=0.25)
         wacc = float(wacc_pct) / 100.0
+        terminal_growth = 0.01
 
-        terminal_growth = 0.02  # matches sheet J12
-        st.caption("DCF method matches your Excel Sheet 1 exactly (4 years + terminal at Year 4, g from TTM vs prior, margin from TTM FCF / TTM Rev).")
         run_dcf = st.button("Calculate DCF", type="primary")
+        st.caption("DCF matches Excel Sheet 1 (4 years + terminal at year 4, g from TTM vs prior, FCF margin from TTM FCF / TTM rev).")
 
     with right:
         st.subheader("DCF Output")
 
         if run_dcf:
-            t = yf.Ticker(ticker)
-
-            market_cap, price = get_market_cap_and_price(t)
-            ttm_rev = get_ttm_revenue(t)
-            prior_rev = get_prior_year_revenue(t)
-            ttm_fcf = get_ttm_fcf(t)
+            market_cap, price, name = get_market_cap_price_name(ticker)
+            ttm_rev = get_ttm_revenue(ticker)
+            prior_rev = get_prior_year_revenue(ticker)
+            ttm_fcf = get_ttm_fcf(ticker)
 
             model = sheet1_dcf_price(
                 market_cap_usd=market_cap,
@@ -512,26 +522,24 @@ with tab_dcf:
                 intrinsic = model["intrinsic"]
                 upside = (intrinsic / price - 1) if (not np.isnan(price) and price > 0) else np.nan
 
+                label, color = valuation_label(intrinsic, price)
+                render_badge(label, color)
+
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Intrinsic Value / Share (USD)", f"{intrinsic:,.2f}")
                 c2.metric("Price (USD)", f"{price:,.2f}" if not np.isnan(price) else "N/A")
                 c3.metric("Upside vs Price", f"{upside:.1%}" if not np.isnan(upside) else "N/A")
 
-                st.divider()
-                st.write("**Inputs & derived rates (MILLIONS):**")
-                st.dataframe(pd.DataFrame({
+                inputs_df = pd.DataFrame({
                     "Metric": [
-                        "Market Cap (M)",
-                        "Shares (M) = MarketCap/Price",
-                        "TTM Revenue (M)",
-                        "Prior Year Revenue (M)",
-                        "Growth g = (TTM-Prior)/Prior",
-                        "TTM FCF (M)",
-                        "FCF Margin = TTM FCF / TTM Rev",
-                        "WACC",
-                        "Terminal Growth",
+                        "Ticker", "Name",
+                        "Market Cap (M)", "Shares (M)=MarketCap/Price",
+                        "TTM Revenue (M)", "Prior Year Revenue (M)",
+                        "Growth g", "TTM FCF (M)", "FCF Margin",
+                        "WACC", "Terminal Growth"
                     ],
                     "Value": [
+                        ticker, name,
                         f"{model['market_cap_m']:,.2f}",
                         f"{model['shares_m']:,.2f}",
                         f"{model['ttm_rev_m']:,.2f}",
@@ -542,23 +550,40 @@ with tab_dcf:
                         f"{wacc:.2%}",
                         f"{terminal_growth:.2%}",
                     ]
-                }), use_container_width=True)
+                })
 
-                st.divider()
-                st.write("**Forecast & PV (MILLIONS):**")
-                years = ["Year 1", "Year 2", "Year 3", "Year 4"]
                 forecast = pd.DataFrame({
-                    "Year": years,
+                    "Year": ["Year 1", "Year 2", "Year 3", "Year 4"],
                     "Revenue (M)": model["revs_m"],
                     "FCF (M)": model["fcfs_m"],
                     "PV of FCF (M)": model["pv_fcfs_m"],
                 })
-                st.dataframe(forecast, use_container_width=True)
 
-                st.divider()
-                st.write("**Terminal & totals (MILLIONS):**")
                 totals = pd.DataFrame({
                     "Component": ["PV Sum (Years 1–4)", "Terminal Value (Year 4)", "PV Terminal", "Total PV (Equity)"],
                     "Value (M)": [model["pv_sum_m"], model["terminal_val_m"], model["terminal_pv_m"], model["pv_total_m"]],
                 })
+
+                st.divider()
+                st.dataframe(inputs_df, use_container_width=True)
+                st.dataframe(forecast, use_container_width=True)
                 st.dataframe(totals, use_container_width=True)
+
+                # Export DCF to Excel
+                excel_bytes = df_to_excel_bytes({
+                    "DCF Inputs": inputs_df,
+                    "DCF Forecast": forecast,
+                    "DCF Totals": totals
+                })
+                st.download_button(
+                    "⬇️ Download DCF (Excel)",
+                    data=excel_bytes,
+                    file_name=f"dcf_{ticker}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+                price_df = get_prices(ticker, "2y")
+                if price_df is not None and not price_df.empty:
+                    st.divider()
+                    st.subheader("Price chart (daily) with MA30 & MA200")
+                    st.plotly_chart(plot_price_ma(price_df, f"{ticker} — Daily Close with MA30 & MA200"), use_container_width=True)

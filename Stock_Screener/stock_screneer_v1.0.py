@@ -104,9 +104,9 @@ elif category == "Technical":
             valid_tickers = []
             for t in filtered_df['Ticker']:
                 is_valid = True
-                if daily_cross and not check_ma_crossover(t, interval="1d", period="2y"):
+                if daily_cross and not check_ma_crossover(t, interval="1d", period="3y"):
                     is_valid = False
-                if is_valid and four_hour_cross and not check_ma_crossover(t, interval="4h", period="60d"):
+                if is_valid and four_hour_cross and not check_ma_crossover(t, interval="4h", period="1y"):
                     is_valid = False
                 
                 if is_valid:
