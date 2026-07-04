@@ -2,7 +2,8 @@
 # NYSE + Nasdaq universe (NasdaqTrader)
 # Tab 1: Screener
 #   - Market cap filter
-#   - MA200 crosses UNDER MA30 within last N trading days (default 7)
+#   - MA200 crosses UNDER MA30 within last N trading days (1-5, default 5)
+#   - Max % deviation of current price vs price on the cross day
 #   - Matched tickers in dropdown -> selecting shows chart
 #   - Export screener results to Excel
 #
@@ -155,20 +156,44 @@ def get_prices(symbol: str, period: str) -> pd.DataFrame:
     return df
 
 
-def cross_under_in_last_n_trading_days(df: pd.DataFrame, n_days: int = 3) -> bool:
+def find_last_cross(df: pd.DataFrame, n_days: int = 5) -> dict | None:
+    """Find the most recent MA200-crosses-under-MA30 event within the last n_days
+    trading days. Returns details about how many days ago it happened and how far
+    the current price has moved from the price on the cross day, or None if no
+    cross occurred in that window."""
     if df is None or df.empty:
-        return False
+        return None
     if "MA30" not in df.columns or "MA200" not in df.columns:
-        return False
+        return None
 
     d = df.dropna(subset=["MA30", "MA200"]).copy()
     if len(d) < max(205, n_days + 2):
-        return False
+        return None
 
     prev200 = d["MA200"].shift(1)
     prev30 = d["MA30"].shift(1)
     cross = (prev200 >= prev30) & (d["MA200"] < d["MA30"])
-    return bool(cross.tail(n_days).any())
+
+    recent = cross.tail(n_days)
+    if not bool(recent.any()):
+        return None
+
+    cross_date = recent[recent].index[-1]
+    days_ago = len(d.loc[cross_date:]) - 1  # trading days since the cross (0 = today)
+
+    price_at_cross = float(d.loc[cross_date, "Close"])
+    current_price = float(d["Close"].iloc[-1])
+    if price_at_cross == 0:
+        return None
+    deviation_pct = (current_price - price_at_cross) / price_at_cross * 100.0
+
+    return {
+        "cross_date": cross_date,
+        "days_ago": int(days_ago),
+        "price_at_cross": price_at_cross,
+        "current_price": current_price,
+        "deviation_pct": deviation_pct,
+    }
 
 
 def plot_price_ma(df: pd.DataFrame, title: str):
@@ -387,7 +412,13 @@ with tab_screener:
         min_mcap = min_mcap_b * 1e9
         max_mcap = max_mcap_b * 1e9
 
-        lookback_days = st.slider("Cross-under lookback (trading days)", 1, 30, 7)
+        lookback_days = st.slider("Cross happened within last N trading days", 1, 5, 5)
+        max_deviation_pct = st.number_input(
+            "Max price deviation from cross price (%)",
+            min_value=0.0, max_value=100.0, value=5.0, step=0.5,
+            help="How far (up or down) the current price is allowed to have moved "
+                 "away from the price on the day the cross happened.",
+        )
         period = st.selectbox("Price history period", ["1y", "2y", "5y"], index=1)
 
         st.subheader("Performance controls")
@@ -422,10 +453,12 @@ with tab_screener:
                 if price_df.empty or len(price_df) < 205:
                     continue
 
-                if not cross_under_in_last_n_trading_days(price_df, n_days=int(lookback_days)):
+                cross_info = find_last_cross(price_df, n_days=int(lookback_days))
+                if cross_info is None:
+                    continue
+                if abs(cross_info["deviation_pct"]) > max_deviation_pct:
                     continue
 
-                last_close = float(price_df["Close"].iloc[-1])
                 exchange = uni.loc[uni["symbol"] == sym, "exchange"].iloc[0]
 
                 results.append({
@@ -433,7 +466,11 @@ with tab_screener:
                     "Name": name,
                     "Exchange": exchange,
                     "MarketCap_fmt": fmt_money_short(market_cap),
-                    "Last_Close": last_close,
+                    "Last_Close": cross_info["current_price"],
+                    "Days_Since_Cross": cross_info["days_ago"],
+                    "Cross_Date": cross_info["cross_date"].strftime("%Y-%m-%d"),
+                    "Price_At_Cross": round(cross_info["price_at_cross"], 2),
+                    "Deviation_%": round(cross_info["deviation_pct"], 2),
                 })
 
                 time.sleep(0.005)
